@@ -1,0 +1,17 @@
+[package]
+name = "farctool"
+version = "1.0.0"
+authors = ["marius851000 <mariusdavid@laposte.net>"]
+edition = "2018"
+description = "A program to extract and list file in a FARC archive, used in pokemon mystery dungeon on 3ds"
+repository = "https://github.com/marius851000/farctool"
+keywords = [ "parser", "tool" ]
+categories = [ "command-line-utilities" ]
+license = "CC0-1.0"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+env_logger = "0.7.1"
+clap = "2.33.0"
+log = "0.4.8"
+pmd_farc = "0.1.0"
