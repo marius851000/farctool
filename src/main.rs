@@ -1,108 +1,138 @@
-#[macro_use]
-extern crate log;
-use clap::{App, Arg, SubCommand};
+use anyhow::{Context, Result};
+use clap::Clap;
 use env_logger;
-use pmd_farc::Farc;
-use std::fs::File;
+use log::{debug, info};
+use pmd_farc::{message_dehash, Farc, FileHashType};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::{fs::File};
 
-fn main() {
+#[derive(Clap)]
+/// tool for reading farc file (PSMD/GTI archive file)
+struct Opts {
+    #[clap(subcommand)]
+    subcmd: SubCommand,
+}
+
+#[derive(Clap)]
+enum SubCommand {
+    Read(ReadParameter),
+}
+
+/// commands that read an input .farc file
+#[derive(Clap)]
+struct ReadParameter {
+    /// a path to the input farc file
+    input: PathBuf,
+    #[clap(short, long)]
+    /// try to \"brute-force\" to file name (isn't a brute force per-see, more try to find in other part of the romfs, if present)
+    brute: bool,
+    #[clap(subcommand)]
+    subcmd: ReadSubCommand,
+}
+
+#[derive(Clap)]
+enum ReadSubCommand {
+    Info(InfoParameter),
+    Extract(ExtractParameter),
+}
+
+#[derive(Clap)]
+/// display some information about the given farc file
+struct InfoParameter {}
+
+#[derive(Clap)]
+/// extract the given farc file to a directory
+struct ExtractParameter {
+    /// a path to the folder in which the files are extracted
+    output: PathBuf,
+}
+
+fn main() -> Result<()> {
     env_logger::init();
-    let matches = App::new("farctool")
-        .about("tool for reading farc file (PSMD/GTI archive file)")
-        .arg(
-            Arg::with_name("input")
-                .short("i")
-                .long("input")
-                .help("the input file of the program")
-                .required(true)
-                .value_name("INPUT"),
-        )
-        /*.arg(
-            Arg::with_name("brute")
-                .short("b")
-                .long("brute")
-                .help("try to \"brute-force\" to file name"),
-        )*/
-        .subcommand(SubCommand::with_name("info").about("display some information about the input"))
-        .subcommand(
-            SubCommand::with_name("extract")
-                .about("extract the file to a directory")
-                .arg(
-                    Arg::with_name("output")
-                        .short("o")
-                        .long("output")
-                        .help("the output directory")
-                        .required(true)
-                        .value_name("OUTPUT"),
-                ),
-        )
-        .get_matches();
+    let opts = Opts::parse();
 
-    let input_path = PathBuf::from(matches.value_of("input").unwrap());
-    let input_file = File::open(&input_path).unwrap();
-    //let input_name = input_path.file_name().unwrap();
-    let farc = Farc::new(input_file).unwrap();
+    match opts.subcmd {
+        SubCommand::Read(read_parameter) => {
+            let input_file = File::open(&read_parameter.input)?;
+            let input_name = read_parameter
+                .input
+                .file_name()
+                .context("unable to get the file name of the FARC file")?
+                .to_str()
+                .context("can't convert the FARC file name to an UTF-8 string")?;
+            let mut farc = Farc::new(input_file).context("unable to parse the FARC file")?;
+            if read_parameter.brute {
+                if farc.file_unknown_name() == 0 {
+                    println!("all name information contained in file. No need to search for them.")
+                } else {
+                    println!("trying to find the name of files");
+                    match FileHashType::predict_from_file_name(input_name) {
+                        Some(FileHashType::Message) => {
+                            if let Some(lst_file_name) = message_dehash::get_file_name(input_name) {
+                                let lst_file_path =
+                                    &read_parameter.input.with_file_name(lst_file_name);
+                                match File::open(lst_file_path) {
+                                    Ok(mut lst_file) => if let Err(err) = message_dehash::try_possible_name(&mut farc, &mut lst_file) {
+                                        println!("ERROR: despite being able to locate and open the list file ({:?}), it did had an error while reading: {}", lst_file_path, err);
+                                    },
+                                    Err(err) => println!("ERROR: can't open the list at {:?}, it can't be opened due to the following error: {}", lst_file_path, err),
+                                };
+                            } else {
+                                println!(
+                                    "ERROR: can't get the name of the associated list for {:?}",
+                                    input_name
+                                );
+                            }
+                        }
+                        None => println!("do not know how to get file name of this archive"),
+                    };
+                    match farc.file_unknown_name() {
+                        0 => println!("all name hash were found"),
+                        remaining => println!("unable to find file name for {} files", remaining),
+                    }
+                }
+            }
 
-    /* if matches.is_present("brute") {
-        info!("trying to find the name of files");
-        if farc.file_count_hashed() == 0 {
-            info!("all name information contained in file. No need to search for them.")
-        } else {
-            if input_name == "pokemon_graphic.bin" {
-                let pgdb_file =
-                    File::open(&input_path.with_file_name("pokemon_graphics_database.bin")).unwrap();
-                    let mut pgdb = pmd_farc::Pgdb::new(pgdb_file).unwrap();
-                pmd_farc::find_name_monster_graphic(&mut farc, &mut pgdb).unwrap();
-            } else {
-                warn!("no way to brute force the name found for this file !");
-            };
-            match farc.file_count_hashed() {
-                0 => info!("all name hash were found"),
-                remaining => info!("unable to find file name for {} files", remaining),
+            match read_parameter.subcmd {
+                ReadSubCommand::Info(_) => {
+                    info!("displaying info");
+                    println!("file with known name :");
+                    for name in farc.iter_name() {
+                        println!("  {}", name);
+                    }
+                    println!("file without known name :");
+                    for crc in farc.iter_hash_unknown_name() {
+                        println!("  {}", crc);
+                    }
+                    println!("file count: {}", farc.file_count());
+                }
+                ReadSubCommand::Extract(extract_parameter) => {
+                    info!("extracting file to {:?}", extract_parameter.output);
+                    for name in farc.iter_name() {
+                        let out_file_path = extract_parameter.output.join(name);
+                        debug!("  extracting {:?} ...", out_file_path);
+                        let mut stored_file = farc.get_named_file(name)?;
+                        let mut in_memory_copy = Vec::new();
+                        stored_file.read_to_end(&mut in_memory_copy)?;
+                        let mut out_file = File::create(out_file_path)?;
+                        out_file.write_all(&in_memory_copy)?;
+                    }
+
+                    for hash in farc.iter_hash_unknown_name().cloned() {
+                        let name = format!("{:?}.bchunk", hash);
+                        let out_file_path = extract_parameter.output.join(name);
+                        debug!("  extracting {} ...", out_file_path.to_string_lossy());
+                        let mut stored_file = farc.get_hashed_file(hash)?;
+                        let mut in_memory_copy = Vec::new();
+                        stored_file.read_to_end(&mut in_memory_copy)?;
+                        let mut out_file = File::create(out_file_path)?;
+                        out_file.write_all(&in_memory_copy)?;
+                    }
+                }
             }
         }
-    }; */
+    };
 
-    if matches.subcommand_matches("info").is_some() {
-        info!("displaying info");
-        println!("file count: {}", farc.file_count());
-        println!("file with known name :");
-        for name in farc.iter_name() {
-            println!("  {}", name);
-        }
-        println!("file without known name :");
-        for crc in farc.iter_hash() {
-            println!("  {}", crc);
-        }
-    }
-
-    if let Some(subcommand) = matches.subcommand_matches("extract") {
-        let out_folder_string = subcommand.value_of("output").unwrap();
-        info!("extracting file to {}", out_folder_string);
-        let out_folder = PathBuf::from(out_folder_string);
-        for name in farc.iter_name() {
-            let out_file_path = out_folder.join(name);
-            debug!("  extracting {} ...", out_file_path.to_string_lossy());
-            let mut stored_file = farc.get_named_file(name).unwrap();
-            let mut in_memory_copy = Vec::new();
-            stored_file.read_to_end(&mut in_memory_copy).unwrap();
-            let mut out_file = File::create(out_file_path).unwrap();
-            out_file.write_all(&in_memory_copy).unwrap();
-        }
-
-        use std::fmt::Write; //TODO:
-        for hash in farc.iter_hash() {
-            let mut name = String::new();
-            write!(&mut name, "{:?}.bchunk", hash).unwrap(); //TODO
-            let out_file_path = out_folder.join(name);
-            debug!("  extracting {} ...", out_file_path.to_string_lossy());
-            let mut stored_file = farc.get_unnamed_file(hash).unwrap();
-            let mut in_memory_copy = Vec::new();
-            stored_file.read_to_end(&mut in_memory_copy).unwrap();
-            let mut out_file = File::create(out_file_path).unwrap();
-            out_file.write_all(&in_memory_copy).unwrap();
-        }
-    }
+    Ok(())
 }
