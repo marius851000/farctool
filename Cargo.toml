@@ -1,6 +1,6 @@
 [package]
 name = "farctool"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["marius851000 <mariusdavid@laposte.net>"]
 edition = "2018"
 description = "A program to extract and list file in a FARC archive, used in pokemon mystery dungeon on 3ds"
