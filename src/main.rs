@@ -1,11 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Clap;
 use env_logger;
 use log::{debug, info};
-use pmd_farc::{message_dehash, Farc, FileHashType};
-use std::io::{Read, Write};
+use pmd_farc::{hash_name, message_dehash, Farc, FarcWriter, FileHashType};
+use std::fs::File;
 use std::path::PathBuf;
-use std::{fs::File};
+use std::{
+    fs::create_dir_all,
+    io::{Read, Write},
+};
 
 #[derive(Clap)]
 /// tool for reading farc file (PSMD/GTI archive file)
@@ -17,9 +20,10 @@ struct Opts {
 #[derive(Clap)]
 enum SubCommand {
     Read(ReadParameter),
+    Write(WriteParameter),
 }
 
-/// commands that read an input .farc file
+/// commands that read an input farc file
 #[derive(Clap)]
 struct ReadParameter {
     /// a path to the input farc file
@@ -45,6 +49,15 @@ struct InfoParameter {}
 /// extract the given farc file to a directory
 struct ExtractParameter {
     /// a path to the folder in which the files are extracted
+    output: PathBuf,
+}
+
+/// create a new farc file from extracted data in the input folder
+#[derive(Clap)]
+struct WriteParameter {
+    /// a path to the folder that contain file to compress
+    input: PathBuf,
+    /// a path tot he output farc file
     output: PathBuf,
 }
 
@@ -109,6 +122,7 @@ fn main() -> Result<()> {
                 }
                 ReadSubCommand::Extract(extract_parameter) => {
                     info!("extracting file to {:?}", extract_parameter.output);
+                    create_dir_all(&extract_parameter.output)?;
                     for name in farc.iter_name() {
                         let out_file_path = extract_parameter.output.join(name);
                         debug!("  extracting {:?} ...", out_file_path);
@@ -132,7 +146,52 @@ fn main() -> Result<()> {
                 }
             }
         }
+        SubCommand::Write(wp) => write(wp)?,
     };
 
+    Ok(())
+}
+
+fn write(wp: WriteParameter) -> Result<()> {
+    // 1. create the farc writer
+    let mut farc_writer = FarcWriter::default();
+    for entry_maybe in wp.input.read_dir()? {
+        let entry = entry_maybe?;
+        let file_name_os = entry.file_name();
+        let full_path = wp.input.join(file_name_os.clone());
+        let file_name = file_name_os.to_str().with_context(|| {
+            format!(
+                "the file name {:?} contain invalid utf8 character",
+                entry.file_name()
+            )
+        })?;
+        if !entry.file_type()?.is_file() {
+            bail!("the file {:?} isn't a file", full_path);
+        };
+        let mut file = File::open(&full_path)?;
+        let mut file_buffer = Vec::new();
+        file.read_to_end(&mut file_buffer)?;
+        let mut point_iter = file_name.split('.');
+        let name_hash: u32 = (if let Some(first_part) = point_iter.next() {
+            if let Some("bchunk") = point_iter.next() {
+                if let Ok(hash) = first_part.parse() {
+                    Some(hash)
+                } else {
+                    bail!("impossible to transform the text {:?} to a 32 bit number (a crc32 hash), for the file at {:?}", first_part, full_path);
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }).unwrap_or_else(|| hash_name(file_name));
+        farc_writer.add_hashed_file(name_hash, file_buffer);
+    }
+
+    // 2. write it
+    let mut out_file = File::create(&wp.output)?;
+    farc_writer.write_hashed(&mut out_file)?;
+
+    println!("file wrote !");
     Ok(())
 }
